@@ -15,7 +15,7 @@
       background: #f6f6f6;
     }
     #hud { margin: 6px auto 10px; font-size: 14px; }
-    .btns { margin: 8px 0 14px; display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+    .btns { margin: 8px 0 14px; display: flex; gap: 8px; justify-content: center; }
     button {
       cursor: pointer; padding: 8px 12px; border-radius: 8px;
       border: 1px solid #999; background: #fff; font-size: 14px;
@@ -33,9 +33,7 @@
 <body>
   <div id="hud">—</div>
   <div class="btns">
-    <button id="restartBtn">⟲</button>
-    <button id="nextBtn" disabled>➡️</button>
-    <button id="resetBtn">⭯</button>
+    <button id="restartBtn" title="Перезапуск">⟲</button>
   </div>
 
   <div id="container">
@@ -44,13 +42,24 @@
   </div>
 
   <script>
-    // Цвета/типы клеток
-    const BLACK = 0, WHITE = 1, RED = 2, BLUE = 3, BOMB = 4;
+    // Типы клеток
+    const BLACK = 0, WHITE = 1, RED = 2;
 
-    // Параметры сетки
+    // Параметры поля
     const gridSize = 50;
     const pixelSize = 8; // CSS-пиксели
     const totalPixels = gridSize * gridSize;
+
+    // Тайминги
+    const GAME_TIME_SEC = 180;
+    const DRAW_WINDOW_MS = 20000; // 20 сек рисования после клика по красному
+    const RED_LIFE_MS_MIN = 1500;
+    const RED_LIFE_MS_MAX = 3000;
+    const RED_RESPAWN_MIN = 1200;
+    const RED_RESPAWN_MAX = 2400;
+
+    // Шум (небольшой)
+    const NOISE_PER_SECOND = 3;
 
     // DOM
     const canvas = document.getElementById('game');
@@ -58,41 +67,22 @@
     const hudEl = document.getElementById('hud');
     const msgEl = document.getElementById('message');
     const restartBtn = document.getElementById('restartBtn');
-    const nextBtn = document.getElementById('nextBtn');
-    const resetBtn = document.getElementById('resetBtn');
-
-    // Уровни (победа только при 100%)
-    const levels = [
-      { time: 90,  noisePerSecond: 2,  redSpawnMin: 1500, redSpawnMax: 3000, redLife: 2500, maxActiveRed: 2 },
-      { time: 120, noisePerSecond: 4,  redSpawnMin: 1000, redSpawnMax: 2000, redLife: 2300, maxActiveRed: 3 },
-      { time: 180, noisePerSecond: 6,  redSpawnMin: 700,  redSpawnMax: 1500, redLife: 2000, maxActiveRed: 4 },
-    ];
 
     // Состояние
     let grid = [];
     let cleared = 0;
-    let score = 0;
     let timeLeft = 0;
-    let levelIndex = 0;
+
+    // Рисование
+    let painting = false;
+    let drawEnabled = false;  // разрешён ли режим "кисть"
+    let drawEnableTimeout = null;
 
     // Таймеры
     let timerInterval = null;
     let noiseInterval = null;
     let redSpawnTimeout = null;
-    let blueInterval = null;
-    let bombTimeout = null;
-
-    // Рисование
-    let painting = false;
-    let drawEnabled = false;
-    let drawEnableTimeout = null;
-    const DRAW_WINDOW_MS = 20000;     // 20 сек
-    const BLUE_PERIOD_MS = 30000;     // каждые 30 сек
-
-    // Активные спец-объекты
-    const activeReds = new Map();     // key -> timeoutId
-    let bluePos = null;               // {x,y} или null
-    const bombs = new Map();          // key -> {armed:boolean}
+    const activeReds = new Map(); // key -> timeoutId
 
     // Утилиты
     const keyOf = (x,y) => y*gridSize + x;
@@ -102,7 +92,7 @@
     // HiDPI
     function setupHiDPI() {
       const dpr = window.devicePixelRatio || 1;
-      const css = gridSize * pixelSize;  // 400
+      const css = gridSize * pixelSize; // 400
       canvas.style.width = css+'px';
       canvas.style.height = css+'px';
       canvas.width = Math.floor(css*dpr);
@@ -126,8 +116,6 @@
       if (st === BLACK) ctx.fillStyle = '#000';
       else if (st === WHITE) ctx.fillStyle = '#fff';
       else if (st === RED)   ctx.fillStyle = '#e10600';
-      else if (st === BLUE)  ctx.fillStyle = '#1e90ff';
-      else if (st === BOMB)  ctx.fillStyle = '#ffd800';
       ctx.fillRect(x*pixelSize, y*pixelSize, pixelSize, pixelSize);
     }
     function drawGridFull() {
@@ -135,37 +123,32 @@
         for (let x=0;x<gridSize;x++) drawCell(x,y);
     }
 
-    // HUD — компактно
+    // HUD — компактный
     function updateHUD() {
       const pct = ((cleared/totalPixels)*100).toFixed(1);
       const m = Math.floor(timeLeft/60), s = timeLeft%60;
       const t = `${m.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`;
       const pen = drawEnabled ? ` ✏️${Math.ceil(remainingDrawSeconds())}s` : '';
-      hudEl.textContent = `✔ ${pct}%  ⏱ ${t}  ⎇ ${levelIndex+1}/${levels.length}  ★ ${score}${pen}`;
+      hudEl.textContent = `✔ ${pct}%  ⏱ ${t}${pen}`;
     }
-
     function remainingDrawSeconds() {
       if (!drawEnabled || !drawEnableTimeout) return 0;
-      const ms = Math.max(0, drawEnableTimeout.when - Date.now());
-      return ms/1000;
+      return Math.max(0, drawEnableTimeout.when - Date.now())/1000;
     }
 
     // Сообщения
     function showMsg(text) { msgEl.textContent = text; msgEl.style.display = 'flex'; }
     function hideMsg() { msgEl.style.display = 'none'; msgEl.textContent = ''; }
 
-    // Смена цвета клетки с учётом счётчиков
+    // Изменения клетки
     function toWhite(x,y) {
       const st = grid[y][x];
       if (st === WHITE) return false;
-      if (st === RED) { // зачистка красного
+      if (st === RED) {
         const id = activeReds.get(keyOf(x,y));
         if (id) { clearTimeout(id); activeReds.delete(keyOf(x,y)); }
-        score += 3;
-      } else if (st === BLUE) {
-        bluePos = null; // поймали "синего"
-      } else if (st === BOMB) {
-        bombs.delete(keyOf(x,y)); // если белим бомбу внешним образом
+        // Включаем рисование на 20 сек
+        activateDrawWindow();
       }
       grid[y][x] = WHITE;
       cleared++;
@@ -174,85 +157,53 @@
     }
     function toBlack(x,y) {
       const st = grid[y][x];
-      if (st === WHITE) { cleared = Math.max(0, cleared-1); }
+      if (st === WHITE) cleared = Math.max(0, cleared-1);
       if (st === RED) {
         const id = activeReds.get(keyOf(x,y));
         if (id) { clearTimeout(id); activeReds.delete(keyOf(x,y)); }
       }
-      if (st === BLUE) bluePos = null;
-      if (st === BOMB) bombs.delete(keyOf(x,y));
       grid[y][x] = BLACK;
       drawCell(x,y);
     }
 
-    // Логика клика/рисования
+    // Игровые действия
     function onCellAction(x,y) {
       if (timeLeft <= 0) return;
 
       const st = grid[y][x];
 
-      // Особые клетки доступны всегда
-      if (st === BLUE) {
-        // Включаем "кисть" на 20с, саму клетку очищаем
-        if (toWhite(x,y)) activateDrawingWindow();
-        afterChange();
-        return;
-      }
-      if (st === RED) {
-        toWhite(x,y);
-        afterChange();
-        return;
-      }
-      if (st === BOMB) {
-        handleBombClick(x,y);
-        afterChange();
-        return;
-      }
+      // Красный — очищаем и активируем рисование
+      if (st === RED) { toWhite(x,y); afterChange(); return; }
 
-      // Обычная зачистка — только если есть право рисовать
-      if (drawEnabled && st === BLACK) {
-        toWhite(x,y);
-        afterChange();
-      }
+      // Обычный клик всегда очищает одну чёрную
+      if (st === BLACK) { toWhite(x,y); afterChange(); return; }
+
+      // Белая — ничего
     }
-
+    function onCellDrag(x,y) {
+      // При рисовании разрешаем “мазать” только если окно активно
+      if (!drawEnabled) return;
+      if (grid[y][x] === BLACK) { toWhite(x,y); afterChange(); }
+    }
     function afterChange() {
       updateHUD();
       checkWin100();
     }
 
-    // Рисование-окно (20 сек)
-    function activateDrawingWindow() {
+    function activateDrawWindow() {
       drawEnabled = true;
       if (drawEnableTimeout) clearTimeout(drawEnableTimeout.id);
       const when = Date.now() + DRAW_WINDOW_MS;
-      const id = setTimeout(() => {
-        drawEnabled = false;
-        updateHUD();
-      }, DRAW_WINDOW_MS);
+      const id = setTimeout(() => { drawEnabled = false; updateHUD(); }, DRAW_WINDOW_MS);
       drawEnableTimeout = { id, when };
       updateHUD();
     }
 
-    // Синие пиксели
-    function spawnBlue() {
-      if (bluePos) return; // только один активный
-      // Ищем чёрную клетку
-      for (let tries=0; tries<500; tries++) {
-        const x = randInt(0,gridSize-1), y = randInt(0,gridSize-1);
-        if (grid[y][x] === BLACK) {
-          grid[y][x] = BLUE;
-          bluePos = {x,y};
-          drawCell(x,y);
-          break;
-        }
-      }
-    }
-
-    // Красные
+    // Красные пиксели
     function spawnRed() {
-      const lvl = levels[levelIndex];
-      if (activeReds.size >= lvl.maxActiveRed) return;
+      // ограничим кол-во активных до 3
+      if (activeReds.size >= 3) return;
+
       let x=0,y=0,ok=false,tries=0;
       while(tries<400 && !ok) {
         x=randInt(0,gridSize-1); y=randInt(0,gridSize-1);
@@ -260,108 +211,34 @@
         tries++;
       }
       if (!ok) return;
+
       grid[y][x] = RED; drawCell(x,y);
       const k = keyOf(x,y);
+      const life = randInt(RED_LIFE_MS_MIN, RED_LIFE_MS_MAX);
       const tid = setTimeout(() => {
         if (grid[y][x] === RED) {
           activeReds.delete(k);
-          // исчезает и штраф: крест из 5 чёрных
+          // Штраф: крест из 5 чёрных (перекрашиваем даже белые)
           grid[y][x] = BLACK; drawCell(x,y);
           const dirs = [[0,0],[1,0],[-1,0],[0,1],[0,-1]];
           for (const [dx,dy] of dirs) {
             const nx=x+dx, ny=y+dy;
             if (nx>=0&&nx<gridSize&&ny>=0&&ny<gridSize) toBlack(nx,ny);
           }
-          score -= 5;
           updateHUD();
         }
-      }, lvl.redLife);
+      }, life);
       activeReds.set(k, tid);
     }
     function scheduleNextRed() {
-      const lvl = levels[levelIndex];
-      const delay = randInt(lvl.redSpawnMin, lvl.redSpawnMax);
-      redSpawnTimeout = setTimeout(() => {
-        spawnRed(); scheduleNextRed();
-      }, delay);
-    }
-
-    // Бомбы (ярко-жёлтые): 1-й клик — телепорт; 2-й — взрыв (очищает 40 чёрных вокруг)
-    function scheduleBomb() {
-      // Спавним раз в 40–60 сек
-      const delay = randInt(40000, 60000);
-      bombTimeout = setTimeout(() => {
-        spawnBomb();
-        scheduleBomb();
-      }, delay);
-    }
-    function spawnBomb() {
-      // ограничим одновременные бомбы до 2
-      if (bombs.size >= 2) return;
-      for (let tries=0; tries<500; tries++) {
-        const x = randInt(0,gridSize-1), y = randInt(0,gridSize-1);
-        if (grid[y][x] === BLACK) {
-          grid[y][x] = BOMB; drawCell(x,y);
-          bombs.set(keyOf(x,y), { armed:false });
-          break;
-        }
-      }
-    }
-    function handleBombClick(x,y) {
-      const k = keyOf(x,y);
-      const info = bombs.get(k);
-      if (!info) return;
-
-      if (!info.armed) {
-        // 1-й клик — телепорт
-        // очищаем старую позицию до чёрной (чтобы было видно перемещение)
-        grid[y][x] = BLACK; drawCell(x,y);
-        bombs.delete(k);
-
-        // новая случайная чёрная позиция
-        let nx=x, ny=y, ok=false, tries=0;
-        while(tries<600 && !ok) {
-          nx = randInt(0,gridSize-1); ny = randInt(0,gridSize-1);
-          if (grid[ny][nx] === BLACK) ok = true;
-          tries++;
-        }
-        grid[ny][nx] = BOMB; drawCell(nx,ny);
-        bombs.set(keyOf(nx,ny), { armed:true });
-      } else {
-        // 2-й клик — взрыв
-        bombs.delete(k);
-        // сама клетка станет белой
-        if (grid[y][x] !== WHITE) toWhite(x,y);
-
-        // очищаем 40 ближайших чёрных клеток вокруг
-        let clearedLocal = 0;
-        const maxR = 10; // радиус поиска
-        for (let r=1; r<=maxR && clearedLocal<40; r++) {
-          // обходим квадратный "ободок" радиуса r
-          for (let dx=-r; dx<=r && clearedLocal<40; dx++) {
-            for (let dy of [-r, r]) {
-              const nx=x+dx, ny=y+dy;
-              if (nx>=0&&nx<gridSize&&ny>=0&&ny<gridSize && grid[ny][nx]===BLACK) {
-                toWhite(nx,ny); clearedLocal++;
-              }
-            }
-          }
-          for (let dy=-r+1; dy<=r-1 && clearedLocal<40; dy++) {
-            for (let dx of [-r, r]) {
-              const nx=x+dx, ny=y+dy;
-              if (nx>=0&&nx<gridSize&&ny>=0&&ny<gridSize && grid[ny][nx]===BLACK) {
-                toWhite(nx,ny); clearedLocal++;
-              }
-            }
-          }
-        }
-      }
+      const delay = randInt(RED_RESPAWN_MIN, RED_RESPAWN_MAX);
+      redSpawnTimeout = setTimeout(() => { spawnRed(); scheduleNextRed(); }, delay);
     }
 
     // Шум: часть белых снова становятся чёрными
-    function applyNoise(count) {
+    function applyNoise(n) {
       let changed = 0, tries = 0;
-      while (changed < count && tries < count*80) {
+      while (changed < n && tries < n*80) {
         const x = randInt(0,gridSize-1), y = randInt(0,gridSize-1);
         if (grid[y][x] === WHITE) { toBlack(x,y); changed++; }
         tries++;
@@ -369,144 +246,113 @@
       if (changed) updateHUD();
     }
 
-    // Победа при 100%
+    // Победа = 100%
     function checkWin100() {
-      if (cleared >= totalPixels) endLevel(true);
+      if (cleared >= totalPixels) endGame(true);
     }
 
-    // Таймер уровня
+    // Таймер
     function startTimer() {
       timerInterval = setInterval(() => {
         timeLeft--; updateHUD();
-        if (timeLeft <= 0) endLevel(false);
+        if (timeLeft <= 0) endGame(false);
       }, 1000);
     }
 
     function showCrack() {
       ctx.save();
-      ctx.strokeStyle = 'rgba(220,220,220,0.9)';
-      ctx.lineWidth = 4;
+      ctx.strokeStyle = 'rgba(220,220,220,0.9)'; ctx.lineWidth = 4;
       ctx.beginPath(); ctx.moveTo(60,70); ctx.lineTo(180,190); ctx.lineTo(320,140);
       ctx.moveTo(40,320); ctx.lineTo(160,260); ctx.lineTo(260,360); ctx.stroke();
       ctx.restore();
     }
 
-    // Инициализация уровня/игры
+    // Жизненный цикл
     function resetGrid() {
       grid = Array.from({length:gridSize}, () => Array(gridSize).fill(BLACK));
       cleared = 0;
-      bluePos = null;
-      activeReds.forEach(id => clearTimeout(id)); activeReds.clear();
-      bombs.clear();
       drawEnabled = false;
       if (drawEnableTimeout) { clearTimeout(drawEnableTimeout.id); drawEnableTimeout = null; }
+      activeReds.forEach(id => clearTimeout(id)); activeReds.clear();
     }
 
-    function startLevel(idx) {
+    function startGame() {
       // Сброс таймеров
-      clearInterval(timerInterval); timerInterval=null;
-      clearInterval(noiseInterval); noiseInterval=null;
-      clearTimeout(redSpawnTimeout); redSpawnTimeout=null;
-      clearInterval(blueInterval); blueInterval=null;
-      clearTimeout(bombTimeout); bombTimeout=null;
+      clearInterval(timerInterval); clearInterval(noiseInterval); clearTimeout(redSpawnTimeout);
+      activeReds.forEach(id => clearTimeout(id)); activeReds.clear();
 
-      levelIndex = idx;
-      resetGrid();
-      hideMsg();
-
+      resetGrid(); hideMsg();
       ctx.clearRect(0,0,canvas.width,canvas.height);
       drawGridFull();
 
-      const lvl = levels[levelIndex];
-      timeLeft = lvl.time;
+      timeLeft = GAME_TIME_SEC;
       updateHUD();
 
-      // Таймеры и спавны
       startTimer();
-      noiseInterval = setInterval(() => applyNoise(lvl.noisePerSecond), 1000);
+      noiseInterval = setInterval(() => applyNoise(NOISE_PER_SECOND), 1000);
       scheduleNextRed();
-      blueInterval = setInterval(spawnBlue, BLUE_PERIOD_MS);
-      scheduleBomb();
 
-      nextBtn.disabled = true;
-      telegramMainButton('⟲', () => startLevel(levelIndex));
+      telegramMainButton('⟲', () => startGame());
     }
 
-    function endLevel(win) {
-      clearInterval(timerInterval); timerInterval=null;
-      clearInterval(noiseInterval); noiseInterval=null;
-      clearTimeout(redSpawnTimeout); redSpawnTimeout=null;
-      clearInterval(blueInterval); blueInterval=null;
-      clearTimeout(bombTimeout); bombTimeout=null;
+    function endGame(win) {
+      clearInterval(timerInterval); clearInterval(noiseInterval); clearTimeout(redSpawnTimeout);
       activeReds.forEach(id => clearTimeout(id)); activeReds.clear();
 
       if (win) {
         showMsg('WIN!');
-        nextBtn.disabled = (levelIndex >= levels.length - 1);
-        telegramMainButton('➡️', () => {
-          if (levelIndex < levels.length - 1) startLevel(levelIndex+1);
-        });
       } else {
         showCrack();
         showMsg('GAME OVER');
-        nextBtn.disabled = true;
-        telegramMainButton('⟲', () => startLevel(levelIndex));
       }
       updateHUD();
+      telegramMainButton('⟲', () => startGame());
     }
 
-    // Управление указателем
+    // Pointer-события
     canvas.addEventListener('pointerdown', (e) => {
       if (timeLeft <= 0) return;
-      painting = true;
-      canvas.setPointerCapture(e.pointerId);
+      painting = true; canvas.setPointerCapture(e.pointerId);
       const {x,y} = getCellFromEvent(e);
-      onCellAction(x,y);
+      onCellAction(x,y); // одиночное действие всегда доступно
     });
     canvas.addEventListener('pointermove', (e) => {
-      if (!painting || !drawEnabled) return;
+      if (!painting) return;
       const {x,y} = getCellFromEvent(e);
-      onCellAction(x,y);
+      onCellDrag(x,y); // “мазать” можно только в окне рисования
     });
-    canvas.addEventListener('pointerup', () => { painting = false; });
+    canvas.addEventListener('pointerup',   () => { painting = false; });
     canvas.addEventListener('pointercancel', () => { painting = false; });
 
-    // Кнопки UI
-    restartBtn.addEventListener('click', () => startLevel(levelIndex));
-    nextBtn.addEventListener('click', () => {
-      if (levelIndex < levels.length - 1) startLevel(levelIndex+1);
-    });
-    resetBtn.addEventListener('click', () => { score = 0; startLevel(0); });
+    // Кнопка UI
+    restartBtn.addEventListener('click', () => startGame());
 
-    // Telegram WebApp интеграция
+    // Telegram
     function telegramMainButton(text, onClick) {
       const tg = window.Telegram && window.Telegram.WebApp;
       if (!tg) return;
       tg.MainButton.hide();
       tg.MainButton.setText(text);
       tg.MainButton.show();
-      tg.MainButton.offClick && tg.MainButton.offClick(); // в некоторых версиях нужен off
+      tg.MainButton.offClick && tg.MainButton.offClick();
       tg.MainButton.onClick(onClick);
     }
     function integrateWithTelegram() {
       const tg = window.Telegram && window.Telegram.WebApp;
       if (!tg) return;
-      tg.ready();
-      tg.expand();
-      // Тема
-      const bg = tg.themeParams?.bg_color;
-      if (bg) document.body.style.background = `#${bg}`;
-      telegramMainButton('⟲', () => startLevel(levelIndex));
+      tg.ready(); tg.expand();
+      const bg = tg.themeParams?.bg_color; if (bg) document.body.style.background = `#${bg}`;
+      telegramMainButton('⟲', () => startGame());
     }
 
-    // Старт
-    (function init() {
+    // Init
+    (function init(){
       setupHiDPI();
       resetGrid();
       drawGridFull();
       updateHUD();
       integrateWithTelegram();
-      startLevel(0);
+      startGame();
     })();
   </script>
 </body>
