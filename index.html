@@ -14,9 +14,6 @@
       user-select: none; -webkit-user-select: none;
       background: #f6f6f6;
       transition: background 0.3s;
-      position: fixed; /* Фиксируем для Telegram */
-      top: 0; left: 0; right: 0; bottom: 0;
-      overflow: hidden; /* Отключаем скролл */
     }
     #hud { margin: 6px auto 10px; font-size: 14px; }
     .btns { margin: 8px 0 14px; display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
@@ -31,33 +28,29 @@
       position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
       background: rgba(0,0,0,0.4); color: #fff; font-size: 22px; font-weight: 700;
       text-shadow: 0 1px 2px #000; padding: 16px;
+      /* Fallback for backdrop-filter */
       backdrop-filter: blur(2px); -webkit-backdrop-filter: blur(2px);
     }
     @supports not (backdrop-filter: blur(2px)) {
       #message { background: rgba(0,0,0,0.8); }
     }
-    #leaderboard { display: none; position: absolute; inset: 0; background: rgba(0,0,0,0.8); color: #fff; padding: 20px; overflow-y: auto; }
-    #multiplayerHud { margin: 4px auto; font-size: 12px; color: #666; }
   </style>
 </head>
 <body>
   <div id="hud">—</div>
-  <div id="multiplayerHud">Игрок 1: 0 очков | Ход: Игрок 1</div>
   <div class="btns">
     <button id="restartBtn" title="Перезапуск">⟲</button>
-    <button id="leaderboardBtn" title="Рекорды">🏆</button>
-    <button id="switchPlayerBtn" title="Сменить игрока">🔄</button>
+    <button id="pauseBtn" title="Пауза">⏸️</button>
   </div>
 
   <div id="container">
     <canvas id="game" width="400" height="400"></canvas>
     <div id="message"></div>
-    <div id="leaderboard"></div>
   </div>
 
   <script>
-    // ==================== КОНСТАНТЫ ====================
-    const BLACK = 0, WHITE = 1, RED = 2, BLUE = 3, YELLOW = 4;
+    // ==================== КОНСТАНТЫ И НАСТРОЙКИ ====================
+    const BLACK = 0, WHITE = 1, RED = 2;
     const gridSize = 50;
     const pixelSize = 8;
     const totalPixels = gridSize * gridSize;
@@ -67,434 +60,87 @@
     const RED_LIFE_MS_MAX = 3000;
     const RED_RESPAWN_MIN = 1200;
     const RED_RESPAWN_MAX = 2400;
-    const BLUE_LIFE_MS_MIN = 2000;
-    const BLUE_LIFE_MS_MAX = 4000;
-    const YELLOW_LIFE_MS_MIN = 3000;
-    const YELLOW_LIFE_MS_MAX = 5000;
-    const BONUS_RESPAWN_MIN = 5000;
-    const BONUS_RESPAWN_MAX = 10000;
     const NOISE_PER_SECOND = 3;
     const LANG = navigator.language.startsWith('ru') ? 'ru' : 'en';
     const TEXTS = {
-      ru: { win: 'ПОБЕДА!', gameOver: 'ИГРА ОКОНЧЕНА', restart: '⟲', leaderboard: '🏆', enterName: 'Введите ваш ник (макс. 20 символов):', records: 'Рекорды:', player: 'Игрок', turn: 'Ход:', points: 'очков' },
-      en: { win: 'WIN!', gameOver: 'GAME OVER', restart: '⟲', leaderboard: '🏆', enterName: 'Enter your nickname (max 20 chars):', records: 'Records:', player: 'Player', turn: 'Turn:', points: 'points' }
+      ru: { win: 'ПОБЕДА!', gameOver: 'ИГРА ОКОНЧЕНА', restart: '⟲', pause: '⏸️', resume: '▶️' },
+      en: { win: 'WIN!', gameOver: 'GAME OVER', restart: '⟲', pause: '⏸️', resume: '▶️' }
     };
 
-    // ==================== КЛАССЫ ====================
-    class PixelGrid {
-      constructor(canvas, ctx) {
-        this.canvas = canvas;
-        this.ctx = ctx;
-        this.grid = Array.from({ length: gridSize }, () => Array(gridSize).fill(BLACK));
-        this.dirtyCells = new Set(); // Для оптимизации рендера
-      }
-
-      get(x, y) { return this.grid[y][x]; }
-      set(x, y, val) { this.grid[y][x] = val; this.dirtyCells.add(`${x},${y}`); }
-
-      drawCell(x, y) {
-        const st = this.get(x, y);
-        this.ctx.fillStyle = st === BLACK ? '#000' : st === WHITE ? '#fff' : st === RED ? '#e10600' : st === BLUE ? '#0066ff' : '#ffff00';
-        this.ctx.fillRect(x * pixelSize, y * pixelSize, pixelSize, pixelSize);
-      }
-
-      renderDirty() {
-        this.dirtyCells.forEach(key => {
-          const [x, y] = key.split(',').map(Number);
-          this.drawCell(x, y);
-        });
-        this.dirtyCells.clear();
-      }
-
-      reset() {
-        this.grid = Array.from({ length: gridSize }, () => Array(gridSize).fill(BLACK));
-        this.dirtyCells.clear();
-      }
-    }
-
-    class SoundManager {
-      constructor() {
-        this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      }
-
-      play(frequency, duration = 200) {
-        if (!this.audioCtx) return;
-        const oscillator = this.audioCtx.createOscillator();
-        const gainNode = this.audioCtx.createGain();
-        oscillator.connect(gainNode);
-        gainNode.connect(this.audioCtx.destination);
-        oscillator.frequency.setValueAtTime(frequency, this.audioCtx.currentTime);
-        gainNode.gain.setValueAtTime(0.1, this.audioCtx.currentTime);
-        gainNode.gain.exponentialRampToValueAtTime(0.01, this.audioCtx.currentTime + duration / 1000);
-        oscillator.start(this.audioCtx.currentTime);
-        oscillator.stop(this.audioCtx.currentTime + duration / 1000);
-      }
-    }
-
-    class Timer {
-      constructor() {
-        this.timers = new Map();
-      }
-
-      setTimeout(key, fn, delay) {
-        this.clear(key);
-        this.timers.set(key, setTimeout(fn, delay));
-      }
-
-      setInterval(key, fn, delay) {
-        this.clear(key);
-        this.timers.set(key, setInterval(fn, delay));
-      }
-
-      clear(key) {
-        if (this.timers.has(key)) {
-          clearTimeout(this.timers.get(key));
-          clearInterval(this.timers.get(key));
-          this.timers.delete(key);
-        }
-      }
-
-      clearAll() {
-        this.timers.forEach((id) => { clearTimeout(id); clearInterval(id); });
-        this.timers.clear();
-      }
-    }
-
-    class Analytics {
-      track(event, data = {}) {
-        const tg = window.Telegram && window.Telegram.WebApp;
-        if (tg && tg.sendData) {
-          tg.sendData(JSON.stringify({ event, ...data, timestamp: Date.now() }));
-        }
-        console.log('Analytics:', event, data); // Fallback для отладки
-      }
-    }
-
-    class TelegramIntegration {
-      constructor() {
-        this.tg = window.Telegram && window.Telegram.WebApp;
-        if (this.tg) {
-          this.tg.ready();
-          this.tg.expand();
-          const bg = this.tg.themeParams?.bg_color;
-          if (bg) document.body.style.background = `#${bg}`;
-        }
-      }
-
-      setMainButton(text, onClick) {
-        if (!this.tg) return;
-        this.tg.MainButton.hide();
-        this.tg.MainButton.setText(text);
-        this.tg.MainButton.show();
-        if (this.tg.MainButton.offClick) this.tg.MainButton.offClick();
-        this.tg.MainButton.onClick(onClick);
-      }
-    }
-
-    class Game {
-      constructor(pixelGrid, soundManager, timer, analytics, telegram) {
-        this.pixelGrid = pixelGrid;
-        this.sound = soundManager;
-        this.timer = timer;
-        this.analytics = analytics;
-        this.telegram = telegram;
-        this.cleared = 0;
-        this.timeLeft = 0;
-        this.painting = false;
-        this.drawEnabled = false;
-        this.drawEnableTimeout = null;
-        this.playerName = localStorage.getItem('playerName') || '';
-        this.startTime = 0;
-        this.activeReds = new Map();
-        this.activeBlues = new Map();
-        this.activeYellows = new Map();
-        // Мультиплеер
-        this.players = [{ name: TEXTS[LANG].player + ' 1', points: 0 }, { name: TEXTS[LANG].player + ' 2', points: 0 }];
-        this.currentPlayer = 0;
-        this.multiplayer = false; // Включить локальный мультиплеер
-      }
-
-      updateHUD() {
-        const pct = ((this.cleared / totalPixels) * 100).toFixed(1);
-        const m = Math.floor(this.timeLeft / 60), s = this.timeLeft % 60;
-        const t = `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-        const pen = this.drawEnabled ? ` ✏️${Math.ceil(this.remainingDrawSeconds())}s` : '';
-        hudEl.textContent = `${pct}%  ⏱ ${t}${pen}`;
-        if (this.multiplayer) {
-          multiplayerHudEl.textContent = `${this.players[0].name}: ${this.players[0].points} ${TEXTS[LANG].points} | ${this.players[1].name}: ${this.players[1].points} ${TEXTS[LANG].points} | ${TEXTS[LANG].turn} ${this.players[this.currentPlayer].name}`;
-        }
-      }
-
-      remainingDrawSeconds() {
-        if (!this.drawEnabled || !this.drawEnableTimeout || !this.drawEnableTimeout.when) return 0;
-        return Math.max(0, this.drawEnableTimeout.when - Date.now()) / 1000;
-      }
-
-      toWhite(x, y) {
-        const st = this.pixelGrid.get(x, y);
-        if (st === WHITE) return false;
-        if (st === RED) {
-          const id = this.activeReds.get(keyOf(x, y));
-          if (id) { this.timer.clear(id); this.activeReds.delete(keyOf(x, y)); }
-          this.activateDrawWindow();
-          this.sound.play(800);
-        } else if (st === BLUE) {
-          const id = this.activeBlues.get(keyOf(x, y));
-          if (id) { this.timer.clear(id); this.activeBlues.delete(keyOf(x, y)); }
-          this.timeLeft += 3;
-          this.sound.play(400);
-        } else if (st === YELLOW) {
-          const id = this.activeYellows.get(keyOf(x, y));
-          if (id) { this.timer.clear(id); this.activeYellows.delete(keyOf(x, y)); }
-          this.explodeYellow(x, y);
-          this.sound.play(200, 500);
-        }
-        this.pixelGrid.set(x, y, WHITE);
-        this.cleared++;
-        if (st !== BLUE && st !== YELLOW) this.sound.play(600);
-        if (this.multiplayer) this.players[this.currentPlayer].points += 1;
-        return true;
-      }
-
-      explodeYellow(cx, cy) {
-        for (let dy = -3; dy <= 3; dy++) {
-          for (let dx = -3; dx <= 3; dx++) {
-            if (dx * dx + dy * dy <= 9) {
-              const nx = cx + dx, ny = cy + dy;
-              if (nx >= 0 && nx < gridSize && ny >= 0 && ny < gridSize && this.pixelGrid.get(nx, ny) !== WHITE) {
-                this.toWhite(nx, ny);
-              }
-            }
-          }
-        }
-      }
-
-      activateDrawWindow() {
-        this.drawEnabled = true;
-        if (this.drawEnableTimeout) this.timer.clear(this.drawEnableTimeout.id);
-        const when = Date.now() + DRAW_WINDOW_MS;
-        const id = this.timer.setTimeout('drawWindow', () => { this.drawEnabled = false; this.updateHUD(); }, DRAW_WINDOW_MS);
-        this.drawEnableTimeout = { id, when };
-        this.updateHUD();
-      }
-
-      spawnRed() {
-        if (this.activeReds.size >= 5) return; // Увеличил лимит
-        let x, y, ok = false, tries = 0;
-        while (tries < 400 && !ok) {
-          x = randInt(0, gridSize - 1);
-          y = randInt(0, gridSize - 1);
-          if (this.pixelGrid.get(x, y) === BLACK) ok = true;
-          tries++;
-        }
-        if (!ok) return;
-        this.pixelGrid.set(x, y, RED);
-        const k = keyOf(x, y);
-        const life = randInt(RED_LIFE_MS_MIN, RED_LIFE_MS_MAX);
-        const tid = this.timer.setTimeout(`red_${k}`, () => {
-          if (this.pixelGrid.get(x, y) === RED) {
-            this.activeReds.delete(k);
-            this.pixelGrid.set(x, y, BLACK);
-            const dirs = [[0,0],[1,0],[-1,0],[0,1],[0,-1]];
-            dirs.forEach(([dx, dy]) => {
-              const nx = x + dx, ny = y + dy;
-              if (nx >= 0 && nx < gridSize && ny >= 0 && ny < gridSize) this.toBlack(nx, ny);
-            });
-            this.updateHUD();
-          }
-        }, life);
-        this.activeReds.set(k, tid);
-      }
-
-      spawnBonus() {
-        const type = Math.random() < 0.5 ? BLUE : YELLOW;
-        const activeMap = type === BLUE ? this.activeBlues : this.activeYellows;
-        if ((type === BLUE && this.activeBlues.size >= 2) || (type === YELLOW && this.activeYellows.size >= 1)) return;
-        let x, y, ok = false, tries = 0;
-        while (tries < 400 && !ok) {
-          x = randInt(0, gridSize - 1);
-          y = randInt(0, gridSize - 1);
-          if (this.pixelGrid.get(x, y) === BLACK) ok = true;
-          tries++;
-        }
-        if (!ok) return;
-        this.pixelGrid.set(x, y, type);
-        const k = keyOf(x, y);
-        const life = randInt(type === BLUE ? BLUE_LIFE_MS_MIN : YELLOW_LIFE_MS_MIN, type === BLUE ? BLUE_LIFE_MS_MAX : YELLOW_LIFE_MS_MAX);
-        const tid = this.timer.setTimeout(`bonus_${k}`, () => {
-          if (this.pixelGrid.get(x, y) === type) {
-            activeMap.delete(k);
-            this.pixelGrid.set(x, y, BLACK);
-          }
-        }, life);
-        activeMap.set(k, tid);
-      }
-
-      toBlack(x, y) {
-        const st = this.pixelGrid.get(x, y);
-        if (st === WHITE) this.cleared = Math.max(0, this.cleared - 1);
-        if (st === RED) {
-          const id = this.activeReds.get(keyOf(x, y));
-          if (id) { this.timer.clear(id); this.activeReds.delete(keyOf(x, y)); }
-        } else if (st === BLUE) {
-          const id = this.activeBlues.get(keyOf(x, y));
-          if (id) { this.timer.clear(id); this.activeBlues.delete(keyOf(x, y)); }
-        } else if (st === YELLOW) {
-          const id = this.activeYellows.get(keyOf(x, y));
-          if (id) { this.timer.clear(id); this.activeYellows.delete(keyOf(x, y)); }
-        }
-        this.pixelGrid.set(x, y, BLACK);
-      }
-
-      applyNoise(n) {
-        let changed = 0, tries = 0;
-        while (changed < n && tries < n * 80) {
-          const x = randInt(0, gridSize - 1), y = randInt(0, gridSize - 1);
-          if (this.pixelGrid.get(x, y) === WHITE) { this.toBlack(x, y); changed++; }
-          tries++;
-        }
-        if (changed) this.updateHUD();
-      }
-
-      checkWin100() {
-        if (this.cleared >= totalPixels) this.endGame(true);
-      }
-
-      onCellAction(x, y) {
-        if (this.timeLeft <= 0) return;
-        const st = this.pixelGrid.get(x, y);
-        if (st === RED || st === BLUE || st === YELLOW) { this.toWhite(x, y); this.afterChange(); }
-        else if (st === BLACK) { this.toWhite(x, y); this.afterChange(); }
-        this.analytics.track('cell_click', { x, y, state: st });
-      }
-
-      onCellDrag(x, y) {
-        if (!this.drawEnabled) return;
-        if (this.pixelGrid.get(x, y) === BLACK) { this.toWhite(x, y); this.afterChange(); }
-      }
-
-      afterChange() {
-        this.pixelGrid.renderDirty();
-        this.updateHUD();
-        this.checkWin100();
-        if (navigator.vibrate) navigator.vibrate(50); // Вибрация
-      }
-
-      switchPlayer() {
-        this.currentPlayer = (this.currentPlayer + 1) % 2;
-        this.updateHUD();
-      }
-
-      startGame() {
-        if (!this.playerName) {
-          this.playerName = prompt(TEXTS[LANG].enterName, '').trim().replace(/[^a-zA-Z0-9]/g, '').substring(0, 20);
-          if (!this.playerName) this.playerName = 'Player';
-          localStorage.setItem('playerName', this.playerName);
-        }
-        this.timer.clearAll();
-        this.pixelGrid.reset();
-        this.cleared = 0;
-        this.drawEnabled = false;
-        if (this.drawEnableTimeout) { this.timer.clear(this.drawEnableTimeout.id); this.drawEnableTimeout = null; }
-        this.activeReds.clear();
-        this.activeBlues.clear();
-        this.activeYellows.clear();
-        hideMsg();
-        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-        this.pixelGrid.grid.forEach((row, y) => row.forEach((_, x) => this.pixelGrid.drawCell(x, y)));
-        this.timeLeft = GAME_TIME_SEC;
-        this.startTime = Date.now();
-        this.updateHUD();
-        this.timer.setInterval('timer', () => {
-          this.timeLeft--;
-          this.updateHUD();
-          if (this.timeLeft <= 0) this.endGame(false);
-        }, 1000);
-        this.timer.setInterval('noise', () => this.applyNoise(NOISE_PER_SECOND), 1000);
-        this.scheduleSpawns();
-        this.telegram.setMainButton(TEXTS[LANG].restart, () => this.startGame());
-        this.analytics.track('game_start');
-      }
-
-      scheduleSpawns() {
-        const scheduleRed = () => {
-          const delay = randInt(RED_RESPAWN_MIN, RED_RESPAWN_MAX);
-          this.timer.setTimeout('red_spawn', () => { this.spawnRed(); scheduleRed(); }, delay);
-        };
-        const scheduleBonus = () => {
-          const delay = randInt(BONUS_RESPAWN_MIN, BONUS_RESPAWN_MAX);
-          this.timer.setTimeout('bonus_spawn', () => { this.spawnBonus(); scheduleBonus(); }, delay);
-        };
-        scheduleRed();
-        scheduleBonus();
-      }
-
-      endGame(win) {
-        this.timer.clearAll();
-        this.activeReds.clear();
-        this.activeBlues.clear();
-        this.activeYellows.clear();
-        if (win) {
-          const elapsed = Math.floor((Date.now() - this.startTime) / 1000);
-          this.saveRecord(elapsed);
-          showMsg(`${TEXTS[LANG].win} (${elapsed}s)`);
-          this.sound.play(1000, 500);
-          this.analytics.track('game_win', { time: elapsed });
-        } else {
-          this.showCrack();
-          showMsg(TEXTS[LANG].gameOver);
-          this.analytics.track('game_over');
-        }
-        this.updateHUD();
-        this.telegram.setMainButton(TEXTS[LANG].restart, () => this.startGame());
-      }
-
-      showCrack() {
-        this.ctx.save();
-        this.ctx.strokeStyle = 'rgba(220,220,220,0.9)';
-        this.ctx.lineWidth = 4;
-        this.ctx.beginPath();
-        this.ctx.moveTo(60, 70); this.ctx.lineTo(180, 190); this.ctx.lineTo(320, 140);
-        this.ctx.moveTo(40, 320); this.ctx.lineTo(160, 260); this.ctx.lineTo(260, 360);
-        this.ctx.stroke();
-        this.ctx.restore();
-      }
-
-      saveRecord(time) {
-        const records = JSON.parse(localStorage.getItem('records') || '[]');
-        records.push({ name: this.playerName, time });
-        records.sort((a, b) => a.time - b.time);
-        localStorage.setItem('records', JSON.stringify(records.slice(0, 5)));
-      }
-    }
-
-    // ==================== DOM И ИНИЦИАЛИЗАЦИЯ ====================
+    // ==================== DOM ЭЛЕМЕНТЫ ====================
     const canvas = document.getElementById('game');
     const ctx = canvas.getContext('2d');
     const hudEl = document.getElementById('hud');
-    const multiplayerHudEl = document.getElementById('multiplayerHud');
+    const msgEl = document.getElementById('message');
     const restartBtn = document.getElementById('restartBtn');
-    const leaderboardBtn = document.getElementById('leaderboardBtn');
-    const switchPlayerBtn = document.getElementById('switchPlayerBtn');
+    const pauseBtn = document.getElementById('pauseBtn');
 
-    const pixelGrid = new PixelGrid(canvas, ctx);
-    const soundManager = new SoundManager();
-    const timer = new Timer();
-    const analytics = new Analytics();
-    const telegram = new TelegramIntegration();
-    const game = new Game(pixelGrid, soundManager, timer, analytics, telegram);
+    // ==================== СОСТОЯНИЕ ИГРЫ ====================
+    let grid = [];
+    let cleared = 0;
+    let timeLeft = 0;
+    let painting = false;
+    let drawEnabled = false;
+    let drawEnableTimeout = null;
+    let isPaused = false;
+    let animationFrameId = null;
 
-    // Утилиты
+    // Таймеры
+    let timerInterval = null;
+    let noiseInterval = null;
+    let redSpawnTimeout = null;
+    const activeReds = new Map();
+
+    // Кэширование для оптимизации
+    const cssSize = gridSize * pixelSize;
+
+    // ==================== УТИЛИТЫ ====================
+    /**
+     * Генерирует ключ для клетки.
+     * @param {number} x - X-координата.
+     * @param {number} y - Y-координата.
+     * @returns {number} Ключ.
+     */
     const keyOf = (x, y) => y * gridSize + x;
+
+    /**
+     * Случайное целое число в диапазоне.
+     * @param {number} a - Минимум.
+     * @param {number} b - Максимум.
+     * @returns {number} Случайное число.
+     */
     const randInt = (a, b) => Math.floor(Math.random() * (b - a + 1)) + a;
+
+    /**
+     * Ограничивает число в диапазоне.
+     * @param {number} n - Число.
+     * @param {number} a - Минимум.
+     * @param {number} b - Максимум.
+     * @returns {number} Ограниченное число.
+     */
     const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
 
-    // HiDPI
+    // ==================== ЗВУКИ (Web Audio API) ====================
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    function playSound(frequency, duration = 200) {
+      if (!audioCtx) return;
+      const oscillator = audioCtx.createOscillator();
+      const gainNode = audioCtx.createGain();
+      oscillator.connect(gainNode);
+      gainNode.connect(audioCtx.destination);
+      oscillator.frequency.setValueAtTime(frequency, audioCtx.currentTime);
+      gainNode.gain.setValueAtTime(0.1, audioCtx.currentTime);
+      gainNode.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + duration / 1000);
+      oscillator.start(audioCtx.currentTime);
+      oscillator.stop(audioCtx.currentTime + duration / 1000);
+    }
+
+    // ==================== HiDPI И АДАПТИВНОСТЬ ====================
     function setupHiDPI() {
       const dpr = window.devicePixelRatio || 1;
-      const containerWidth = Math.min(window.innerWidth - 32, 600);
-      const scale = Math.max(containerWidth / (gridSize * pixelSize), 0.75);
-      const scaledSize = (gridSize * pixelSize) * scale;
+      const containerWidth = Math.min(window.innerWidth - 32, 600); // Адаптивность
+      const scale = Math.max(containerWidth / cssSize, 0.75); // Минимум 75%
+      const scaledSize = cssSize * scale;
       canvas.style.width = scaledSize + 'px';
       canvas.style.height = scaledSize + 'px';
       canvas.width = Math.floor(scaledSize * dpr);
@@ -502,60 +148,311 @@
       ctx.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0);
     }
 
+    // ==================== КООРДИНАТЫ ====================
     function getCellFromEvent(e) {
-      const rect = canvas.getBoundingRect();
-      const scaleX = (gridSize * pixelSize) / rect.width;
-      const scaleY = (gridSize * pixelSize) / rect.height;
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = cssSize / rect.width;
+      const scaleY = cssSize / rect.height;
       const cx = Math.floor(((e.clientX - rect.left) * scaleX) / pixelSize);
       const cy = Math.floor(((e.clientY - rect.top) * scaleY) / pixelSize);
       return { x: clamp(cx, 0, gridSize - 1), y: clamp(cy, 0, gridSize - 1) };
     }
 
+    // ==================== РЕНДЕР ====================
+    function drawCell(x, y) {
+      const st = grid[y][x];
+      ctx.fillStyle = st === BLACK ? '#000' : st === WHITE ? '#fff' : '#e10600';
+      ctx.fillRect(x * pixelSize, y * pixelSize, pixelSize, pixelSize);
+    }
+
+    function drawGridFull() {
+      for (let y = 0; y < gridSize; y++) {
+        for (let x = 0; x < gridSize; x++) {
+          drawCell(x, y);
+        }
+      }
+    }
+
+    function render() {
+      if (!isPaused) {
+        animationFrameId = requestAnimationFrame(render);
+      }
+    }
+
+    // ==================== HUD ====================
+    function updateHUD() {
+      const pct = ((cleared / totalPixels) * 100).toFixed(1);
+      const m = Math.floor(timeLeft / 60), s = timeLeft % 60;
+      const t = `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+      const pen = drawEnabled ? ` ✏️${Math.ceil(remainingDrawSeconds())}s` : '';
+      hudEl.textContent = `✔ ${pct}%  ⏱ ${t}${pen}`;
+    }
+
+    function remainingDrawSeconds() {
+      if (!drawEnabled || !drawEnableTimeout || !drawEnableTimeout.when) return 0;
+      return Math.max(0, drawEnableTimeout.when - Date.now()) / 1000;
+    }
+
+    // ==================== СООБЩЕНИЯ ====================
     function showMsg(text) { msgEl.textContent = text; msgEl.style.display = 'flex'; }
     function hideMsg() { msgEl.style.display = 'none'; msgEl.textContent = ''; }
 
-    function showLeaderboard() {
-      const records = JSON.parse(localStorage.getItem('records') || '[]');
-      let html = `<h2>${TEXTS[LANG].records}</h2><ol>`;
-      records.forEach(r => html += `<li>${r.name}: ${r.time}s</li>`);
-      html += '</ol><button onclick="hideLeaderboard()">Закрыть</button>';
-      leaderboardEl.innerHTML = html;
-      leaderboardEl.style.display = 'flex';
+    // ==================== ИЗМЕНЕНИЯ КЛЕТОК ====================
+    function toWhite(x, y) {
+      const st = grid[y][x];
+      if (st === WHITE) return false;
+      if (st === RED) {
+        const id = activeReds.get(keyOf(x, y));
+        if (id) { clearTimeout(id); activeReds.delete(keyOf(x, y)); }
+        activateDrawWindow();
+        playSound(800); // Звук для красного
+      }
+      grid[y][x] = WHITE;
+      cleared++;
+      drawCell(x, y);
+      playSound(600); // Звук для клика
+      return true;
     }
 
-    function hideLeaderboard() { leaderboardEl.style.display = 'none'; }
+    function toBlack(x, y) {
+      const st = grid[y][x];
+      if (st === WHITE) cleared = Math.max(0, cleared - 1);
+      if (st === RED) {
+        const id = activeReds.get(keyOf(x, y));
+        if (id) { clearTimeout(id); activeReds.delete(keyOf(x, y)); }
+      }
+      grid[y][x] = BLACK;
+      drawCell(x, y);
+    }
 
-    // События
+    // ==================== ИГРОВЫЕ ДЕЙСТВИЯ ====================
+    function onCellAction(x, y) {
+      if (timeLeft <= 0 || isPaused) return;
+      const st = grid[y][x];
+      if (st === RED) { toWhite(x, y); afterChange(); }
+      else if (st === BLACK) { toWhite(x, y); afterChange(); }
+    }
+
+    function onCellDrag(x, y) {
+      if (!drawEnabled || isPaused) return;
+      if (grid[y][x] === BLACK) { toWhite(x, y); afterChange(); }
+    }
+
+    function afterChange() {
+      updateHUD();
+      checkWin100();
+      saveProgress();
+    }
+
+    function activateDrawWindow() {
+      drawEnabled = true;
+      if (drawEnableTimeout) clearTimeout(drawEnableTimeout.id);
+      const when = Date.now() + DRAW_WINDOW_MS;
+      const id = setTimeout(() => { drawEnabled = false; updateHUD(); }, DRAW_WINDOW_MS);
+      drawEnableTimeout = { id, when };
+      updateHUD();
+    }
+
+    // ==================== КРАСНЫЕ ПИКСЕЛИ ====================
+    function spawnRed() {
+      if (activeReds.size >= 3) return;
+      let x, y, ok = false, tries = 0;
+      while (tries < 400 && !ok) {
+        x = randInt(0, gridSize - 1);
+        y = randInt(0, gridSize - 1);
+        if (grid[y][x] === BLACK) ok = true;
+        tries++;
+      }
+      if (!ok) return;
+      grid[y][x] = RED;
+      drawCell(x, y);
+      const k = keyOf(x, y);
+      const life = randInt(RED_LIFE_MS_MIN, RED_LIFE_MS_MAX);
+      const tid = setTimeout(() => {
+        if (grid[y][x] === RED) {
+          activeReds.delete(k);
+          grid[y][x] = BLACK;
+          drawCell(x, y);
+          const dirs = [[0,0],[1,0],[-1,0],[0,1],[0,-1]];
+          dirs.forEach(([dx, dy]) => {
+            const nx = x + dx, ny = y + dy;
+            if (nx >= 0 && nx < gridSize && ny >= 0 && ny < gridSize) toBlack(nx, ny);
+          });
+          updateHUD();
+        }
+      }, life);
+      activeReds.set(k, tid);
+    }
+
+    function scheduleNextRed() {
+      const delay = randInt(RED_RESPAWN_MIN, RED_RESPAWN_MAX);
+      redSpawnTimeout = setTimeout(() => { spawnRed(); scheduleNextRed(); }, delay);
+    }
+
+    // ==================== ШУМ ====================
+    function applyNoise(n) {
+      let changed = 0, tries = 0;
+      while (changed < n && tries < n * 80) {
+        const x = randInt(0, gridSize - 1), y = randInt(0, gridSize - 1);
+        if (grid[y][x] === WHITE) { toBlack(x, y); changed++; }
+        tries++;
+      }
+      if (changed) updateHUD();
+    }
+
+    // ==================== ПОБЕДА ====================
+    function checkWin100() {
+      if (cleared >= totalPixels) endGame(true);
+    }
+
+    // ==================== ТАЙМЕР ====================
+    function startTimer() {
+      timerInterval = setInterval(() => {
+        if (!isPaused) {
+          timeLeft--;
+          updateHUD();
+          if (timeLeft <= 0) endGame(false);
+        }
+      }, 1000);
+    }
+
+    // ==================== ПАУЗА И СОХРАНЕНИЕ ====================
+    function togglePause() {
+      isPaused = !isPaused;
+      pauseBtn.textContent = isPaused ? TEXTS[LANG].resume : TEXTS[LANG].pause;
+      if (isPaused) {
+        saveProgress();
+      } else {
+        render();
+      }
+    }
+
+    function saveProgress() {
+      localStorage.setItem('annoyingPixel', JSON.stringify({ grid, cleared, timeLeft, drawEnabled }));
+    }
+
+    function loadProgress() {
+      const data = localStorage.getItem('annoyingPixel');
+      if (data) {
+        const parsed = JSON.parse(data);
+        grid = parsed.grid;
+        cleared = parsed.cleared;
+        timeLeft = parsed.timeLeft;
+        drawEnabled = parsed.drawEnabled;
+        drawGridFull();
+        updateHUD();
+      }
+    }
+
+    // ==================== КОНЕЦ ИГРЫ ====================
+    function showCrack() {
+      ctx.save();
+      ctx.strokeStyle = 'rgba(220,220,220,0.9)';
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.moveTo(60, 70); ctx.lineTo(180, 190); ctx.lineTo(320, 140);
+      ctx.moveTo(40, 320); ctx.lineTo(160, 260); ctx.lineTo(260, 360);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function resetGrid() {
+      grid = Array.from({ length: gridSize }, () => Array(gridSize).fill(BLACK));
+      cleared = 0;
+      drawEnabled = false;
+      if (drawEnableTimeout) { clearTimeout(drawEnableTimeout.id); drawEnableTimeout = null; }
+      activeReds.forEach(id => clearTimeout(id));
+      activeReds.clear();
+    }
+
+    function startGame() {
+      clearInterval(timerInterval);
+      clearInterval(noiseInterval);
+      clearTimeout(redSpawnTimeout);
+      activeReds.forEach(id => clearTimeout(id));
+      activeReds.clear();
+      resetGrid();
+      hideMsg();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      drawGridFull();
+      timeLeft = GAME_TIME_SEC;
+      isPaused = false;
+      updateHUD();
+      startTimer();
+      noiseInterval = setInterval(() => applyNoise(NOISE_PER_SECOND), 1000);
+      scheduleNextRed();
+      telegramMainButton(TEXTS[LANG].restart, () => startGame());
+      render();
+    }
+
+    function endGame(win) {
+      clearInterval(timerInterval);
+      clearInterval(noiseInterval);
+      clearTimeout(redSpawnTimeout);
+      activeReds.forEach(id => clearTimeout(id));
+      activeReds.clear();
+      if (win) {
+        showMsg(TEXTS[LANG].win);
+        playSound(1000, 500); // Звук победы
+      } else {
+        showCrack();
+        showMsg(TEXTS[LANG].gameOver);
+      }
+      updateHUD();
+      telegramMainButton(TEXTS[LANG].restart, () => startGame());
+      localStorage.removeItem('annoyingPixel');
+    }
+
+    // ==================== СОБЫТИЯ ====================
     canvas.addEventListener('pointerdown', (e) => {
-      e.preventDefault(); // Фикс для Telegram
-      if (game.timeLeft <= 0) return;
-      game.painting = true;
+      if (timeLeft <= 0 || isPaused) return;
+      painting = true;
       canvas.setPointerCapture(e.pointerId);
       const { x, y } = getCellFromEvent(e);
-      game.onCellAction(x, y);
+      onCellAction(x, y);
     });
     canvas.addEventListener('pointermove', (e) => {
-      e.preventDefault(); // Фикс для Telegram
-      if (!game.painting) return;
+      if (!painting) return;
       const { x, y } = getCellFromEvent(e);
-      game.onCellDrag(x, y);
+      onCellDrag(x, y);
     });
-    canvas.addEventListener('pointerup', () => { game.painting = false; });
-    canvas.addEventListener('pointercancel', () => { game.painting = false; });
+    canvas.addEventListener('pointerup', () => { painting = false; });
+    canvas.addEventListener('pointercancel', () => { painting = false; });
 
-    restartBtn.addEventListener('click', () => game.startGame());
-    leaderboardBtn.addEventListener('click', () => showLeaderboard());
-    switchPlayerBtn.addEventListener('click', () => game.switchPlayer());
+    restartBtn.addEventListener('click', () => startGame());
+    pauseBtn.addEventListener('click', () => togglePause());
 
-    // Инициализация
+    // ==================== TELEGRAM ====================
+    function telegramMainButton(text, onClick) {
+      const tg = window.Telegram && window.Telegram.WebApp;
+      if (!tg) return;
+      tg.MainButton.hide();
+      tg.MainButton.setText(text);
+      tg.MainButton.show();
+      if (tg.MainButton.offClick) tg.MainButton.offClick();
+      tg.MainButton.onClick(onClick);
+    }
+
+    function integrateWithTelegram() {
+      const tg = window.Telegram && window.Telegram.WebApp;
+      if (!tg) return;
+      tg.ready();
+      tg.expand();
+      const bg = tg.themeParams?.bg_color;
+      if (bg) document.body.style.background = `#${bg}`;
+      telegramMainButton(TEXTS[LANG].restart, () => startGame());
+    }
+
+    // ==================== ИНИЦИАЛИЗАЦИЯ ====================
     (function init() {
       setupHiDPI();
-      pixelGrid.reset();
-      pixelGrid.grid.forEach((row, y) => row.forEach((_, x) => pixelGrid.drawCell(x, y)));
-      game.updateHUD();
-      telegram.setMainButton(TEXTS[LANG].restart, () => game.startGame());
+      resetGrid();
+      drawGridFull();
+      updateHUD();
+      integrateWithTelegram();
+      loadProgress();
+      startGame();
       window.addEventListener('resize', setupHiDPI);
-      game.startGame();
     })();
   </script>
 </body>
