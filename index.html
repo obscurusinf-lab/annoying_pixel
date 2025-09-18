@@ -39,8 +39,7 @@
 <body>
   <div id="hud">—</div>
   <div class="btns">
-    <button id="restartBtn" title="Перезапуск">⟲</button>
-    <button id="pauseBtn" title="Пауза">⏸️</button>
+    <button id="restartBtn" title="Restart">⟲</button>
   </div>
 
   <div id="container">
@@ -50,22 +49,30 @@
 
   <script>
     // ==================== КОНСТАНТЫ И НАСТРОЙКИ ====================
-    const BLACK = 0, WHITE = 1, RED = 2;
+    const BLACK = 0, WHITE = 1, RED = 2, BLUE = 5;
     const gridSize = 50;
     const pixelSize = 8;
     const totalPixels = gridSize * gridSize;
-    const GAME_TIME_SEC = 180;
+    const GAME_TIME_SEC = 90; // Сокращено до 1,5 минуты (было 180)
     const DRAW_WINDOW_MS = 20000;
-    const RED_LIFE_MS_MIN = 1500;
-    const RED_LIFE_MS_MAX = 3000;
-    const RED_RESPAWN_MIN = 1200;
-    const RED_RESPAWN_MAX = 2400;
+    const BOMB_LIFE_MS_MIN = 3000;
+    const BOMB_LIFE_MS_MAX = 5000;
+    const BONUS_RESPAWN_MIN = 3000; // Уменьшено на 40% (было 5000)
+    const BONUS_RESPAWN_MAX = 6000; // Уменьшено на 40% (было 10000)
+    const BLUE_LIFE_MS_MIN = 8000; // Изменено на 8 секунд
+    const BLUE_LIFE_MS_MAX = 8000; // Изменено на 8 секунд
+    const BLUE_RESPAWN_MIN = 8000;
+    const BLUE_RESPAWN_MAX = 15000;
     const NOISE_PER_SECOND = 3;
-    const LANG = navigator.language.startsWith('ru') ? 'ru' : 'en';
+    const LANG = 'en'; // Всегда английский
     const TEXTS = {
       ru: { win: 'ПОБЕДА!', gameOver: 'ИГРА ОКОНЧЕНА', restart: '⟲', pause: '⏸️', resume: '▶️' },
       en: { win: 'WIN!', gameOver: 'GAME OVER', restart: '⟲', pause: '⏸️', resume: '▶️' }
     };
+    // Новые константы для динамического звука
+    const BASE_FREQ = 200;
+    const SPEED_MULTIPLIER = 50;
+    const SOUND_THROTTLE_MS = 50;
 
     // ==================== DOM ЭЛЕМЕНТЫ ====================
     const canvas = document.getElementById('game');
@@ -73,23 +80,29 @@
     const hudEl = document.getElementById('hud');
     const msgEl = document.getElementById('message');
     const restartBtn = document.getElementById('restartBtn');
-    const pauseBtn = document.getElementById('pauseBtn');
 
     // ==================== СОСТОЯНИЕ ИГРЫ ====================
     let grid = [];
     let cleared = 0;
     let timeLeft = 0;
     let painting = false;
-    let drawEnabled = false;
+    let drawEnabled = true; // По умолчанию включено
     let drawEnableTimeout = null;
     let isPaused = false;
     let animationFrameId = null;
+    // Новые переменные для скорости мыши
+    let lastTime = 0;
+    let lastX = 0;
+    let lastY = 0;
+    let lastSoundTime = 0;
 
     // Таймеры
     let timerInterval = null;
     let noiseInterval = null;
-    let redSpawnTimeout = null;
-    const activeReds = new Map();
+    let bonusSpawnTimeout = null;
+    let blueSpawnTimeout = null;
+    const activeBombs = new Map();
+    const activeBlues = new Map();
 
     // Кэширование для оптимизации
     const cssSize = gridSize * pixelSize;
@@ -123,7 +136,7 @@
     // ==================== ЗВУКИ (Web Audio API) ====================
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     function playSound(frequency, duration = 200) {
-      if (!audioCtx) return;
+      if (!audioCtx || audioCtx.state !== 'running') return;
       const oscillator = audioCtx.createOscillator();
       const gainNode = audioCtx.createGain();
       oscillator.connect(gainNode);
@@ -159,9 +172,11 @@
     }
 
     // ==================== РЕНДЕР ====================
-    function drawCell(x, y) {
+    function drawCell(x, y, isAnimated = false) {
       const st = grid[y][x];
-      ctx.fillStyle = st === BLACK ? '#000' : st === WHITE ? '#fff' : '#e10600';
+      let color = st === BLACK ? '#000' : st === WHITE ? '#fff' : st === RED ? '#e10600' : st === BLUE ? '#0000ff' : '#000';
+      if (isAnimated && st === BLACK) color = '#fff'; // Для чёрных пикселей во время анимации делаем белыми для видимости
+      ctx.fillStyle = color;
       ctx.fillRect(x * pixelSize, y * pixelSize, pixelSize, pixelSize);
     }
 
@@ -184,13 +199,8 @@
       const pct = ((cleared / totalPixels) * 100).toFixed(1);
       const m = Math.floor(timeLeft / 60), s = timeLeft % 60;
       const t = `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-      const pen = drawEnabled ? ` ✏️${Math.ceil(remainingDrawSeconds())}s` : '';
+      const pen = drawEnabled ? ` ✏️∞` : ''; // Бесконечно, поскольку всегда включено
       hudEl.textContent = `✔ ${pct}%  ⏱ ${t}${pen}`;
-    }
-
-    function remainingDrawSeconds() {
-      if (!drawEnabled || !drawEnableTimeout || !drawEnableTimeout.when) return 0;
-      return Math.max(0, drawEnableTimeout.when - Date.now()) / 1000;
     }
 
     // ==================== СООБЩЕНИЯ ====================
@@ -198,19 +208,31 @@
     function hideMsg() { msgEl.style.display = 'none'; msgEl.textContent = ''; }
 
     // ==================== ИЗМЕНЕНИЯ КЛЕТОК ====================
-    function toWhite(x, y) {
+    function toWhite(x, y, isDrag = false) {
       const st = grid[y][x];
       if (st === WHITE) return false;
       if (st === RED) {
-        const id = activeReds.get(keyOf(x, y));
-        if (id) { clearTimeout(id); activeReds.delete(keyOf(x, y)); }
-        activateDrawWindow();
-        playSound(800); // Звук для красного
+        const id = activeBombs.get(keyOf(x, y));
+        if (id) { clearTimeout(id); activeBombs.delete(keyOf(x, y)); }
+        grid[y][x] = WHITE;
+        cleared++;
+        drawCell(x, y);
+        playSound(100, 300); // Глухой звук взрыва (низкая частота)
+        animateExplosion(x, y); // Анимированный взрыв
+        return true; // Ранний return, чтобы не дублировать ниже
+      } else if (st === BLUE) {
+        const id = activeBlues.get(keyOf(x, y));
+        if (id) { clearTimeout(id); activeBlues.delete(keyOf(x, y)); }
+        timeLeft += 3; // Сокращено с 10 до 3
+        updateHUD();
+        playSound(400);
       }
-      grid[y][x] = WHITE;
-      cleared++;
-      drawCell(x, y);
-      playSound(600); // Звук для клика
+      if (st !== RED) { // Для синего и чёрного
+        grid[y][x] = WHITE;
+        cleared++;
+        drawCell(x, y);
+        playSound(600);
+      }
       return true;
     }
 
@@ -218,24 +240,101 @@
       const st = grid[y][x];
       if (st === WHITE) cleared = Math.max(0, cleared - 1);
       if (st === RED) {
-        const id = activeReds.get(keyOf(x, y));
-        if (id) { clearTimeout(id); activeReds.delete(keyOf(x, y)); }
+        const id = activeBombs.get(keyOf(x, y));
+        if (id) { clearTimeout(id); activeBombs.delete(keyOf(x, y)); }
+      } else if (st === BLUE) {
+        const id = activeBlues.get(keyOf(x, y));
+        if (id) { clearTimeout(id); activeBlues.delete(keyOf(x, y)); }
       }
       grid[y][x] = BLACK;
       drawCell(x, y);
+    }
+
+    // ==================== АНИМИРОВАННЫЙ ВЗРЫВ КРАСНОГО ====================
+    function animateExplosion(cx, cy) {
+      const explosionPixels = [];
+      for (let dy = -3; dy <= 3; dy++) {
+        for (let dx = -3; dx <= 3; dx++) {
+          if (dx * dx + dy * dy <= 9) {
+            const nx = cx + dx, ny = cy + dy;
+            if ((nx !== cx || ny !== cy) && nx >= 0 && nx < gridSize && ny >= 0 && ny < gridSize && grid[ny][nx] !== WHITE && grid[ny][nx] !== RED) {
+              const dist = Math.sqrt(dx * dx + dy * dy);
+              explosionPixels.push({ x: nx, y: ny, dist });
+            }
+          }
+        }
+      }
+      explosionPixels.sort((a, b) => a.dist - b.dist); // Сортировка по расстоянию
+
+      drawGridFull(); // Рисуем сетку один раз перед анимацией
+      animatePixelExplosion(explosionPixels);
+
+      // После завершения анимаций закрасить пиксели и перерисовать
+      setTimeout(() => {
+        explosionPixels.forEach(pixel => {
+          toWhite(pixel.x, pixel.y, true);
+        });
+        ctx.clearRect(0, 0, canvas.width, canvas.height); // Полная очистка Canvas
+        drawGridFull(); // Перерисовка сетки
+      }, 900);
+    }
+
+    function animatePixelExplosion(pixels) {
+      const startTime = Date.now();
+      const duration = 800; // мс на анимацию
+      const delayPerDist = 50; // Задержка на единицу расстояния
+
+      function animate() {
+        const elapsed = Date.now() - startTime;
+        const progress = Math.min(elapsed / duration, 1);
+
+        pixels.forEach(pixel => {
+          const pixelStart = pixel.dist * delayPerDist;
+          const pixelProgress = Math.max(0, (elapsed - pixelStart) / duration);
+          if (pixelProgress > 0 && pixelProgress <= 1) {
+            let scale;
+            if (pixelProgress < 0.5) {
+              scale = 1 + pixelProgress * 2; // Увеличение до 2x
+            } else {
+              scale = 2 - (pixelProgress - 0.5) * 2; // Уменьшение до 1x
+            }
+            // Цвет по кругам
+            let color;
+            if (pixel.dist <= 1) color = '#ffff00'; // Жёлтый для первого круга
+            else if (pixel.dist <= 2) color = '#ff8000'; // Оранжевый для второго
+            else color = '#654321'; // Тёмно-коричневый для третьего
+            ctx.save();
+            ctx.translate(pixel.x * pixelSize + pixelSize / 2, pixel.y * pixelSize + pixelSize / 2);
+            ctx.scale(scale, scale);
+            ctx.translate(-pixelSize / 2, -pixelSize / 2);
+            ctx.fillStyle = color;
+            ctx.fillRect(0, 0, pixelSize, pixelSize);
+            ctx.restore();
+          }
+        });
+
+        if (progress < 1) {
+          requestAnimationFrame(animate);
+        }
+      }
+      requestAnimationFrame(animate);
     }
 
     // ==================== ИГРОВЫЕ ДЕЙСТВИЯ ====================
     function onCellAction(x, y) {
       if (timeLeft <= 0 || isPaused) return;
       const st = grid[y][x];
-      if (st === RED) { toWhite(x, y); afterChange(); }
+      if (st === RED || st === BLUE) { toWhite(x, y); afterChange(); }
       else if (st === BLACK) { toWhite(x, y); afterChange(); }
     }
 
     function onCellDrag(x, y) {
-      if (!drawEnabled || isPaused) return;
-      if (grid[y][x] === BLACK) { toWhite(x, y); afterChange(); }
+      if (!drawEnabled || isPaused) return; // Рисование работает если drawEnabled
+      const st = grid[y][x];
+      if (st === BLACK || (drawEnabled && (st === RED || st === BLUE))) {
+        toWhite(x, y, true); // Эффекты срабатывают
+        afterChange();
+      }
     }
 
     function afterChange() {
@@ -244,18 +343,9 @@
       saveProgress();
     }
 
-    function activateDrawWindow() {
-      drawEnabled = true;
-      if (drawEnableTimeout) clearTimeout(drawEnableTimeout.id);
-      const when = Date.now() + DRAW_WINDOW_MS;
-      const id = setTimeout(() => { drawEnabled = false; updateHUD(); }, DRAW_WINDOW_MS);
-      drawEnableTimeout = { id, when };
-      updateHUD();
-    }
-
-    // ==================== КРАСНЫЕ ПИКСЕЛИ ====================
-    function spawnRed() {
-      if (activeReds.size >= 3) return;
+    // ==================== КРАСНЫЕ ПИКСЕЛИ (БОМБЫ) ====================
+    function spawnBomb() {
+      if (activeBombs.size >= 1) return;
       let x, y, ok = false, tries = 0;
       while (tries < 400 && !ok) {
         x = randInt(0, gridSize - 1);
@@ -267,26 +357,50 @@
       grid[y][x] = RED;
       drawCell(x, y);
       const k = keyOf(x, y);
-      const life = randInt(RED_LIFE_MS_MIN, RED_LIFE_MS_MAX);
+      const life = randInt(BOMB_LIFE_MS_MIN, BOMB_LIFE_MS_MAX);
       const tid = setTimeout(() => {
         if (grid[y][x] === RED) {
-          activeReds.delete(k);
+          activeBombs.delete(k);
           grid[y][x] = BLACK;
           drawCell(x, y);
-          const dirs = [[0,0],[1,0],[-1,0],[0,1],[0,-1]];
-          dirs.forEach(([dx, dy]) => {
-            const nx = x + dx, ny = y + dy;
-            if (nx >= 0 && nx < gridSize && ny >= 0 && ny < gridSize) toBlack(nx, ny);
-          });
-          updateHUD();
         }
       }, life);
-      activeReds.set(k, tid);
+      activeBombs.set(k, tid);
     }
 
-    function scheduleNextRed() {
-      const delay = randInt(RED_RESPAWN_MIN, RED_RESPAWN_MAX);
-      redSpawnTimeout = setTimeout(() => { spawnRed(); scheduleNextRed(); }, delay);
+    function scheduleNextBomb() {
+      const delay = randInt(BONUS_RESPAWN_MIN, BONUS_RESPAWN_MAX);
+      bonusSpawnTimeout = setTimeout(() => { spawnBomb(); scheduleNextBomb(); }, delay);
+    }
+
+    // ==================== СИНИЕ ПИКСЕЛИ (БОНУС ВРЕМЕНИ) ====================
+    function spawnBlue() {
+      if (activeBlues.size >= 1) return;
+      let x, y, ok = false, tries = 0;
+      while (tries < 400 && !ok) {
+        x = randInt(0, gridSize - 1);
+        y = randInt(0, gridSize - 1);
+        if (grid[y][x] === BLACK) ok = true;
+        tries++;
+      }
+      if (!ok) return;
+      grid[y][x] = BLUE;
+      drawCell(x, y);
+      const k = keyOf(x, y);
+      const life = randInt(BLUE_LIFE_MS_MIN, BLUE_LIFE_MS_MAX);
+      const tid = setTimeout(() => {
+        if (grid[y][x] === BLUE) {
+          activeBlues.delete(k);
+          grid[y][x] = BLACK;
+          drawCell(x, y);
+        }
+      }, life);
+      activeBlues.set(k, tid);
+    }
+
+    function scheduleNextBlue() {
+      const delay = randInt(BLUE_RESPAWN_MIN, BLUE_RESPAWN_MAX);
+      blueSpawnTimeout = setTimeout(() => { spawnBlue(); scheduleNextBlue(); }, delay);
     }
 
     // ==================== ШУМ ====================
@@ -317,16 +431,6 @@
     }
 
     // ==================== ПАУЗА И СОХРАНЕНИЕ ====================
-    function togglePause() {
-      isPaused = !isPaused;
-      pauseBtn.textContent = isPaused ? TEXTS[LANG].resume : TEXTS[LANG].pause;
-      if (isPaused) {
-        saveProgress();
-      } else {
-        render();
-      }
-    }
-
     function saveProgress() {
       localStorage.setItem('annoyingPixel', JSON.stringify({ grid, cleared, timeLeft, drawEnabled }));
     }
@@ -338,7 +442,7 @@
         grid = parsed.grid;
         cleared = parsed.cleared;
         timeLeft = parsed.timeLeft;
-        drawEnabled = parsed.drawEnabled;
+        drawEnabled = parsed.drawEnabled !== undefined ? parsed.drawEnabled : true; // По умолчанию true
         drawGridFull();
         updateHUD();
       }
@@ -359,18 +463,23 @@
     function resetGrid() {
       grid = Array.from({ length: gridSize }, () => Array(gridSize).fill(BLACK));
       cleared = 0;
-      drawEnabled = false;
+      drawEnabled = true; // По умолчанию
       if (drawEnableTimeout) { clearTimeout(drawEnableTimeout.id); drawEnableTimeout = null; }
-      activeReds.forEach(id => clearTimeout(id));
-      activeReds.clear();
+      activeBombs.forEach(id => clearTimeout(id));
+      activeBombs.clear();
+      activeBlues.forEach(id => clearTimeout(id));
+      activeBlues.clear();
     }
 
     function startGame() {
       clearInterval(timerInterval);
       clearInterval(noiseInterval);
-      clearTimeout(redSpawnTimeout);
-      activeReds.forEach(id => clearTimeout(id));
-      activeReds.clear();
+      clearTimeout(bonusSpawnTimeout);
+      clearTimeout(blueSpawnTimeout);
+      activeBombs.forEach(id => clearTimeout(id));
+      activeBombs.clear();
+      activeBlues.forEach(id => clearTimeout(id));
+      activeBlues.clear();
       resetGrid();
       hideMsg();
       ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -380,7 +489,8 @@
       updateHUD();
       startTimer();
       noiseInterval = setInterval(() => applyNoise(NOISE_PER_SECOND), 1000);
-      scheduleNextRed();
+      scheduleNextBomb();
+      scheduleNextBlue();
       telegramMainButton(TEXTS[LANG].restart, () => startGame());
       render();
     }
@@ -388,9 +498,12 @@
     function endGame(win) {
       clearInterval(timerInterval);
       clearInterval(noiseInterval);
-      clearTimeout(redSpawnTimeout);
-      activeReds.forEach(id => clearTimeout(id));
-      activeReds.clear();
+      clearTimeout(bonusSpawnTimeout);
+      clearTimeout(blueSpawnTimeout);
+      activeBombs.forEach(id => clearTimeout(id));
+      activeBombs.clear();
+      activeBlues.forEach(id => clearTimeout(id));
+      activeBlues.clear();
       if (win) {
         showMsg(TEXTS[LANG].win);
         playSound(1000, 500); // Звук победы
@@ -399,28 +512,50 @@
         showMsg(TEXTS[LANG].gameOver);
       }
       updateHUD();
-      telegramMainButton(TEXTS[LANG].restart, () => startGame());
+      telegramMainButton('Share Score', () => {
+        const tg = window.Telegram && window.Telegram.WebApp;
+        if (tg) {
+          const data = JSON.stringify({ win, cleared: ((cleared / totalPixels) * 100).toFixed(1), timeLeft });
+          tg.sendData(data);
+        }
+      });
       localStorage.removeItem('annoyingPixel');
     }
 
     // ==================== СОБЫТИЯ ====================
     canvas.addEventListener('pointerdown', (e) => {
       if (timeLeft <= 0 || isPaused) return;
+      if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume(); // Разблокировка звука
       painting = true;
       canvas.setPointerCapture(e.pointerId);
       const { x, y } = getCellFromEvent(e);
       onCellAction(x, y);
+      lastTime = Date.now(); // Инициализация для скорости
+      lastX = x;
+      lastY = y;
     });
     canvas.addEventListener('pointermove', (e) => {
-      if (!painting) return;
       const { x, y } = getCellFromEvent(e);
+      const now = Date.now();
+      const dt = now - lastTime;
+      if (dt > 0 && painting) {
+        const speed = Math.sqrt((x - lastX) ** 2 + (y - lastY) ** 2) / dt; // Скорость в пикселях/мс
+        if (now - lastSoundTime > SOUND_THROTTLE_MS) {
+          const frequency = BASE_FREQ + speed * SPEED_MULTIPLIER;
+          playSound(frequency, 100);
+          lastSoundTime = now;
+        }
+      }
+      lastTime = now;
+      lastX = x;
+      lastY = y;
+      if (!painting) return;
       onCellDrag(x, y);
     });
     canvas.addEventListener('pointerup', () => { painting = false; });
     canvas.addEventListener('pointercancel', () => { painting = false; });
 
     restartBtn.addEventListener('click', () => startGame());
-    pauseBtn.addEventListener('click', () => togglePause());
 
     // ==================== TELEGRAM ====================
     function telegramMainButton(text, onClick) {
